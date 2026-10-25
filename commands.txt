@@ -1,0 +1,6 @@
+ls
+cd documents
+unknown_command
+ls $USERNAME
+cd one two
+ls
