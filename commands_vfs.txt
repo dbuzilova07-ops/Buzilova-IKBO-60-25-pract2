@@ -1,0 +1,8 @@
+vfs-info
+ls
+cd documents
+ls $USERNAME
+vfs-info wrong
+unknown_command
+cd one two
+vfs-info

@@ -4,29 +4,97 @@ import socket
 import os
 import shlex
 import argparse
+import hashlib
 from pathlib import Path
 
-# Получаем параметры запуска
+# Параметры запуска
 parser = argparse.ArgumentParser(description="Эмулятор UNIX")
 parser.add_argument("--vfs", help="Путь к виртуальной файловой системе")
 parser.add_argument("--script", help="Путь к стартовому скрипту")
 config = parser.parse_args()
 
-# Отладочный вывод параметров
 print("Параметры эмулятора:")
 print("VFS:", config.vfs)
 print("Стартовый скрипт:", config.script)
 
-# Получаем данные операционной системы
 username = getpass.getuser()
 hostname = socket.gethostname()
 
-# Создаём графическое окно
+# Данные виртуальной файловой системы
+vfs_files = {}
+vfs_dirs = set()
+vfs_name = None
+vfs_hash = None
+vfs_error = None
+
+# Флаг завершения приложения
+closing = False
+
+
+def update_hash(hasher, data):
+    # Добавляем длину данных и сами данные
+    hasher.update(len(data).to_bytes(8, "big"))
+    hasher.update(data)
+
+
+def load_vfs(path):
+    global vfs_files, vfs_dirs, vfs_name, vfs_hash
+
+    source = Path(path)
+
+    if not source.exists():
+        raise FileNotFoundError(f"VFS не найдена: {path}")
+
+    if not source.is_dir():
+        raise ValueError("VFS должна быть директорией")
+
+    if source.is_symlink():
+        raise ValueError("Символические ссылки не поддерживаются")
+
+    files = {}
+    directories = set()
+
+    # Получаем все файлы и каталоги
+    for item in source.rglob("*"):
+        if item.is_symlink():
+            raise ValueError(f"Символическая ссылка: {item}")
+
+        relative_path = item.relative_to(source).as_posix()
+
+        if item.is_dir():
+            directories.add(relative_path)
+
+        elif item.is_file():
+            # Читаем содержимое в память
+            files[relative_path] = item.read_bytes()
+
+        else:
+            raise ValueError(f"Неподдерживаемый объект: {item}")
+
+    # Вычисляем общий хеш VFS
+    hasher = hashlib.sha256()
+
+    for directory in sorted(directories):
+        hasher.update(b"D")
+        update_hash(hasher, directory.encode("utf-8"))
+
+    for filename in sorted(files):
+        hasher.update(b"F")
+        update_hash(hasher, filename.encode("utf-8"))
+        update_hash(hasher, files[filename])
+
+    # Сохраняем загруженные данные
+    vfs_files = files
+    vfs_dirs = directories
+    vfs_name = source.name
+    vfs_hash = hasher.hexdigest()
+
+
+# Графический интерфейс
 root = tk.Tk()
 root.title(f"Эмулятор - [{username}@{hostname}]")
 root.geometry("800x500")
 
-# История терминала
 terminal = tk.Text(
     root,
     bg="black",
@@ -36,7 +104,6 @@ terminal = tk.Text(
 )
 terminal.pack(fill=tk.BOTH, expand=True)
 
-# Поле ввода команд
 command_entry = tk.Entry(
     root,
     bg="black",
@@ -56,11 +123,10 @@ def print_terminal(text):
 
 
 def execute_command(command):
-    try:
-        # Подставляем переменные окружения
-        command = os.path.expandvars(command)
+    global closing
 
-        # Разделяем команду на части
+    try:
+        command = os.path.expandvars(command)
         parts = shlex.split(command)
 
         if not parts:
@@ -75,10 +141,27 @@ def execute_command(command):
 
         elif name == "cd":
             if len(args) > 1:
-                print_terminal("Ошибка: cd принимает не более одного аргумента")
+                print_terminal(
+                    "Ошибка: cd принимает не более одного аргумента"
+                )
                 return False
 
             print_terminal(f"cd: аргументы {args}")
+            return True
+
+        elif name == "vfs-info":
+            if args:
+                print_terminal("Ошибка: vfs-info не принимает аргументы")
+                return False
+
+            if vfs_name is None:
+                print_terminal("Ошибка: VFS не загружена")
+                return False
+
+            print_terminal(f"Имя VFS: {vfs_name}")
+            print_terminal(f"SHA-256: {vfs_hash}")
+            print_terminal(f"Количество файлов: {len(vfs_files)}")
+            print_terminal(f"Количество папок: {len(vfs_dirs)}")
             return True
 
         elif name == "exit":
@@ -86,7 +169,8 @@ def execute_command(command):
                 print_terminal("Ошибка: exit не принимает аргументы")
                 return False
 
-            root.destroy()
+            closing = True
+            root.after_idle(root.destroy)
             return True
 
         else:
@@ -119,7 +203,7 @@ def run_startup_script():
         print_terminal(f"Запуск скрипта: {config.script}")
 
         for line_number, line in enumerate(commands, start=1):
-            if not root.winfo_exists():
+            if closing:
                 break
 
             command = line.strip()
@@ -128,26 +212,39 @@ def run_startup_script():
                 continue
 
             print_terminal("$ " + command)
-
             success = execute_command(command)
 
             if not success:
                 print_terminal(
-                    f"Ошибка в строке {line_number}. Продолжаем выполнение."
+                    f"Ошибка в строке {line_number}. "
+                    "Продолжаем выполнение."
                 )
 
-        if root.winfo_exists():
+        if not closing:
             print_terminal("Выполнение скрипта завершено.")
 
     except (OSError, UnicodeError) as error:
-        print_terminal(f"Ошибка выполнения стартового скрипта: {error}")
+        print_terminal(f"Ошибка стартового скрипта: {error}")
+
+
+def initialize():
+    global vfs_error
+
+    print_terminal("Добро пожаловать в эмулятор UNIX!")
+
+    if config.vfs:
+        try:
+            load_vfs(config.vfs)
+            print_terminal(f"VFS загружена: {vfs_name}")
+
+        except (OSError, ValueError) as error:
+            vfs_error = str(error)
+            print_terminal(f"Ошибка загрузки VFS: {vfs_error}")
+
+    run_startup_script()
 
 
 command_entry.bind("<Return>", on_enter)
 
-print_terminal("Добро пожаловать в эмулятор UNIX!")
-
-# Автоматически выполняем скрипт после открытия окна
-root.after(100, run_startup_script)
-
+root.after(100, initialize)
 root.mainloop()
